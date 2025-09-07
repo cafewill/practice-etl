@@ -11,26 +11,21 @@ dc-지역카테고리.py — DiningCode 리스트 JSON에서
     * data/region/regions-road-addr-unique.json
     * data/category/categories.json
 
-화면 출력:
-- 처리 진행 상황: --log-every N (기본 100건마다)
-- name / name_json(ko,en,cn) 프리뷰: --show-name-json true
-- 지역 리포트: --show-region-report true
+번역:
+- --translate {auto|romanize|off} (기본 romanize)
+- Papago 고정(키는 --config config.json; X-NCP-APIGW-API-KEY-ID / X-NCP-APIGW-API-KEY)
+- translate-max 기본 무제한(0 → 무제한), 캐시 파일(--cache-file) + 메모리 캐시
+- trace 켜면 [CACHE]/[SKIP]/[IDENTITY] 표시 + 400 RAW 미리보기(N2MT05는 원문 반환)
 
-번역 옵션(지역적재와 동일):
-  --translate {auto|romanize|off} (default: romanize)
-  --translate-timeout 2.0
-  --translate-max 200
-  --translate-provider {auto_chain|googletrans|deep} (default: auto_chain)
-  --zh-variant {cn|tw}
-  --cache-file <path>
+시드(Seed) 병합:
+- --region-seed <json> : {"l1","l2","l3","count"} 리스트 파일을 카운터에 병합
+- --category-seed <json> : {"category","count"} 리스트 파일을 카운터에 병합
+- --seed-top-k N : 시드에서 count 상위 N개만 사용(0이면 제한 없음)
+- --seed-min-count M : 시드에서 count ≥ M 인 것만 채택
+- 저장되는 unique 결과/리포트/프리뷰에 시드가 반영됨 (per-shop 리스트는 스캔 결과만)
 
-카테고리 번역 품질 향상:
-- CATEGORY_GLOSSARY_EN/CN 사전 우선 적용
-- 영어는 항상 Title Case로 정규화 (BBQ 등 전부 대문자 토큰 보존)
-
-부트스트랩 친절 로그:
-- 시드가 없으면 "skip augment" 안내를 출력 (첫 실행에 유용)
-- 시드가 있으면 top-k / min-count 기준으로 사전 보강 후 추가/스킵 건수 출력
+호환:
+- --translate-provider 는 더 이상 쓰지 않지만, 전달되면 경고 출력 후 무시
 """
 
 import argparse
@@ -43,7 +38,10 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------------- 공통 유틸 ----------------
 
@@ -179,21 +177,46 @@ def split_categories(cat: Optional[str]) -> List[str]:
             seen.add(t); out.append(t)
     return out
 
-# ====== 번역/로마자 — 지역적재와 동일 + 제주 지명/카테고리 보강 ===================
+# ====== 번역/로마자 — Papago 기반 ===================
 
 _RE_HANGUL = re.compile(r"[가-힣]")
+_RE_HAN = re.compile(r"[\u4E00-\u9FFF]")
 _L = ["g","kk","n","d","tt","r","m","b","pp","s","ss","","j","jj","ch","k","t","p","h"]
 _V = ["a","ae","ya","yae","eo","e","yeo","ye","o","wa","wae","oe","yo","u","wo","we","wi","yu","eu","ui","i"]
 _T = ["","k","k","ks","n","nj","nh","t","l","lk","lm","lb","ls","lt","lp","lh","m","p","ps","t","t","ng","t","t","k","t","p","t"]
 
 _roman_cache: Dict[str, str] = {}
-_trans_cache: Dict[Tuple[str, str], str] = {}   # (dest, norm_text) -> translated
+_trans_cache: Dict[Tuple[str, str], str] = {}   # (dest_norm, norm_text) -> translated
 
 def _norm_key(s: str) -> str:
     return re.sub(r"\s+"," ", (s or "").strip()).lower()
 
 def has_hangul(s: str) -> bool:
     return bool(_RE_HANGUL.search(s or ""))
+
+def detect_lang_simple(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return "unknown"
+    if _RE_HANGUL.search(s):
+        return "ko"
+    if _RE_HAN.search(s):
+        return "zh"
+    ascii_cnt = sum(1 for ch in s if ord(ch) < 128)
+    alpha_cnt = sum(1 for ch in s if ch.isalpha())
+    if ascii_cnt >= max(1, int(len(s) * 0.9)) and alpha_cnt > 0:
+        return "en"
+    return "unknown"
+
+def norm_dest_lang(dest: str) -> str:
+    d = (dest or "").lower().replace("_", "-")
+    if d in ("en", "english"):
+        return "en"
+    if d in ("cn", "zh", "zh-cn", "zh-hans"):
+        return "zh-CN"
+    if d in ("tw", "zh-tw", "zh-hant"):
+        return "zh-TW"
+    return dest
 
 def romanize_korean(text: str) -> str:
     key = _norm_key(text)
@@ -215,66 +238,271 @@ def romanize_korean(text: str) -> str:
     _roman_cache[key] = res
     return res
 
-def _try_googletrans(text: str, dest: str, src: str = "ko") -> Optional[str]:
-    try:
-        from googletrans import Translator  # type: ignore
-        tr = Translator()
-        res = tr.translate(text, src=src, dest=dest)
-        return res.text if getattr(res, "text", None) else None
-    except Exception:
-        return None
+# --------- HTTP 세션 ---------
 
-def _try_deeptranslator(text: str, dest: str, src: str = "ko") -> Optional[str]:
-    try:
-        from deep_translator import GoogleTranslator  # type: ignore
-        tr = GoogleTranslator(source=src, target=dest)
-        return tr.translate(text)
-    except Exception:
-        return None
+def _requests_session(timeout: float = 8.0) -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.3,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+    s.request_timeout = timeout
+    return s
 
-def _run_with_timeout(fn, timeout_sec: float, *args, **kwargs) -> Optional[str]:
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(fn, *args, **kwargs)
+# --------- Papago 에러 집계/요약 ---------
+
+PAPAGO_ERRORS: List[Dict[str, Any]] = []
+PAPAGO_STATS = {"ok": 0, "err": 0, "codes": Counter(), "ecodes": Counter()}
+
+def _log_papago_error(event: Dict[str, Any], trace: bool):
+    PAPAGO_ERRORS.append(event)
+    PAPAGO_STATS["err"] += 1
+    if event.get("status") is not None:
+        PAPAGO_STATS["codes"][str(event["status"])] += 1
+    ecode = event.get("errorCode")
+    if ecode:
+        PAPAGO_STATS["ecodes"][str(ecode)] += 1
+    if trace:
+        status = event.get("status")
+        ecode = event.get("errorCode")
+        emsg  = event.get("errorMessage")
+        remain = event.get("headers_snippet", {}).get("x-ratelimit-remaining") or \
+                 event.get("headers_snippet", {}).get("x-ratelimit-remaining-minute")
+        print(f"[TX][papago][ERR] status={status} ecode={ecode} remain={remain} msg={emsg}")
+
+def _log_papago_ok():
+    PAPAGO_STATS["ok"] += 1
+
+def _print_papago_summary():
+    if PAPAGO_STATS["ok"] + PAPAGO_STATS["err"] == 0:
+        return
+    print("\n[TX][papago] 요약")
+    print(f"  - 성공 OK: {PAPAGO_STATS['ok']}")
+    print(f"  - 실패 ERR: {PAPAGO_STATS['err']}")
+    if PAPAGO_STATS["codes"]:
+        print("  - HTTP별:", dict(PAPAGO_STATS["codes"].most_common()))
+    if PAPAGO_STATS["ecodes"]:
+        print("  - 에러코드별:", dict(PAPAGO_STATS["ecodes"].most_common()))
+    if PAPAGO_ERRORS:
+        print("  - 대표 에러 예시(최신 3건):")
+        for ev in PAPAGO_ERRORS[-3:]:
+            print(f"    • ts={ev.get('ts')} status={ev.get('status')} "
+                  f"ecode={ev.get('errorCode')} msg={ev.get('errorMessage')} "
+                  f"len={ev.get('len')} target={ev.get('target')}")
+
+def _save_papago_errors(path: Optional[str]):
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(PAPAGO_ERRORS, f, ensure_ascii=False, indent=2)
+        print(f"[TX][papago] 에러 로그 저장 → {path} ({len(PAPAGO_ERRORS)}건)")
+    except Exception as e:
+        print(f"[TX][papago] 에러 로그 저장 실패: {e}", file=sys.stderr)
+
+# --------- Papago 클라이언트 ---------
+
+class PapagoClient:
+    PAPAGO_URL = "https://papago.apigw.ntruss.com/nmt/v1/translation"
+
+    def __init__(self, config_path: str = "config.json", timeout: float = 8.0, trace: bool = False):
+        self.timeout = timeout
+        self.trace = trace
+        self.session = _requests_session(timeout=timeout)
+        self.headers = self._load_headers(config_path)
+
+    @staticmethod
+    def _load_headers(config_path: str) -> Dict[str, str]:
         try:
-            return fut.result(timeout=timeout_sec)
-        except FuturesTimeout:
-            return None
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
         except Exception:
-            return None
+            cfg = {}
+        client_id = cfg.get("PAPAGO_CLIENT_ID") or cfg.get("X-NCP-APIGW-API-KEY-ID") or ""
+        client_secret = cfg.get("PAPAGO_CLIENT_SECRET") or cfg.get("X-NCP-APIGW-API-KEY") or ""
+        return {
+            "X-NCP-APIGW-API-KEY-ID": client_id,
+            "X-NCP-APIGW-API-KEY": client_secret,
+            "Content-Type": "application/json",
+        }
+
+    @staticmethod
+    def _normalize_lang(code: str) -> str:
+        if not code:
+            return "en"
+        c = code.replace("_", "-").lower()
+        mapping = {
+            "cn": "zh-CN", "zh": "zh-CN", "zh-cn": "zh-CN", "zh-hans": "zh-CN",
+            "tw": "zh-TW", "zh-tw": "zh-TW", "zh-hant": "zh-TW"
+        }
+        out = mapping.get(c, code)
+        out = out.replace("_", "-")
+        if out.lower() == "zh-cn": return "zh-CN"
+        if out.lower() == "zh-tw": return "zh-TW"
+        return out
+
+    def _parse_error_payload(self, obj: Any) -> Tuple[Optional[str], Optional[str]]:
+        code = msg = None
+        if isinstance(obj, dict):
+            if "error" in obj and isinstance(obj["error"], dict):
+                code = obj["error"].get("errorCode")
+                msg = obj["error"].get("message") or obj["error"].get("errorMessage")
+            code = code or obj.get("errorCode")
+            msg = msg or obj.get("errorMessage")
+        return code, msg
+
+    def translate(self, text: str, target: str, source: str = "auto", honorific: bool = True) -> str:
+        if text is None:
+            return ""
+        payload = {
+            "source": source or "auto",
+            "target": self._normalize_lang(target),
+            "text": str(text),
+            "honorific": "true" if honorific else "false",
+        }
+        try:
+            r = self.session.post(self.PAPAGO_URL, headers=self.headers, json=payload, timeout=self.timeout)
+            status = r.status_code
+
+            if status == 200:
+                try:
+                    data = r.json()
+                    out = (data.get("message", {}).get("result", {}).get("translatedText") or "").strip()
+                except Exception:
+                    out = ""
+                if out:
+                    _log_papago_ok()
+                    if self.trace:
+                        print(f"[TX][papago][OK] len={len(text)} → {payload['target']}")
+                    return out
+                event = {
+                    "ts": now_local_str(), "status": status, "errorCode": "EMPTY_RESULT",
+                    "errorMessage": "translatedText empty", "target": payload["target"],
+                    "src": payload["source"], "len": len(text),
+                    "headers_snippet": {k.lower(): v for k, v in r.headers.items() if k.lower().startswith("x-")}
+                }
+                _log_papago_error(event, self.trace)
+                return ""
+
+            # 실패: 400 예외처리(N2MT05)
+            err_json, err_text = {}, ""
+            try:
+                err_json = r.json()
+            except Exception:
+                err_text = r.text
+
+            ecode, emsg = self._parse_error_payload(err_json)
+
+            RAW_MAX = 4096
+            raw_body = None
+            if status == 400:
+                raw_body = (r.text or "")[:RAW_MAX]
+                preview = raw_body[:600].replace("\n", " ")
+                print(f"[TX][papago][400] target={payload['target']} len={len(text)} RAW({len(raw_body)}B) = {preview}")
+                blob = (preview or "").lower()
+                if (ecode == "N2MT05") or ("source and target must be different" in blob):
+                    if self.trace:
+                        print(f"[TX][papago][IDENTITY] source==target; return original (len={len(text)})")
+                    _log_papago_ok()
+                    return text
+
+            event = {
+                "ts": now_local_str(), "status": status,
+                "errorCode": ecode,
+                "errorMessage": emsg if emsg else (err_text[:400] if err_text else None),
+                "target": payload["target"], "src": payload["source"], "len": len(text),
+                "headers_snippet": {k.lower(): v for k, v in r.headers.items() if k.lower().startswith("x-")}
+            }
+            if raw_body is not None:
+                event["raw_body"] = raw_body
+            _log_papago_error(event, self.trace)
+            return ""
+
+        except Exception as e:
+            event = {
+                "ts": now_local_str(), "status": None, "errorCode": "EXCEPTION",
+                "errorMessage": str(e), "target": payload["target"], "src": source or "auto", "len": len(text),
+                "headers_snippet": {}
+            }
+            _log_papago_error(event, self.trace)
+            return ""
+
+# --------- 번역 컨트롤 (Papago 고정) ---------
 
 class TransCtl:
-    def __init__(self, provider: str, timeout: float, max_calls: int, zh_variant: str,
-                 trace: bool = False):
-        self.provider = provider  # auto_chain | googletrans | deep
+    """
+    provider:
+      - "papago" : Papago 호출(고정)
+      - "none"   : 외부 번역 미사용(romanize/off용 내부 경로)
+    """
+    def __init__(self, use_papago: bool, timeout: float, max_calls: Optional[int],
+                 zh_variant: str, trace: bool, config_path: str,
+                 papago_honorific: bool = True):
+        self.provider = "papago" if use_papago else "none"
         self.timeout = timeout
-        self.max_calls = max_calls
+        self.max_calls = max_calls  # None이면 무제한
         self.calls_used = 0
         self.zh_variant = "zh-TW" if zh_variant == "tw" else "zh-CN"
         self.trace = trace
+        self.papago_honorific = papago_honorific
+        self.papago = PapagoClient(config_path=config_path, timeout=timeout, trace=trace) if use_papago else None
 
     def _can_call(self) -> bool:
-        return self.max_calls is None or self.calls_used < self.max_calls
+        return (self.max_calls is None) or (self.calls_used < self.max_calls)
 
     def translate(self, text: str, dest: str) -> Optional[str]:
-        key = (dest, _norm_key(text))
+        dest_norm = norm_dest_lang(dest)
+        key = (dest_norm, _norm_key(text))
+        # 캐시 HIT
         if key in _trans_cache:
+            if self.trace:
+                print(f"[TX][papago][OK] len={len(text)} → {dest_norm} [CACHE]")
             return _trans_cache[key]
+
+        # 입력언어 = 목적언어 → 스킵
+        lang = detect_lang_simple(text)
+        if (dest_norm == "en" and lang == "en") or \
+           (dest_norm in ("zh-CN","zh-TW") and lang == "zh"):
+            if self.trace:
+                print(f"[TX][papago][OK] len={len(text)} → {dest_norm} [SKIP]")
+            _log_papago_ok()
+            _trans_cache[key] = text
+            return text
+
         if not self._can_call():
+            if self.trace:
+                print(f"[TX] translate_max reached ({self.max_calls}); keep original.")
             return None
+
         out: Optional[str] = None
-        if self.provider in ("googletrans", "auto_chain"):
+
+        if self.provider == "papago":
             self.calls_used += 1
-            if self.trace: print(f"[TX] googletrans → {dest}: '{text}'")
-            out = _run_with_timeout(_try_googletrans, self.timeout, text, dest, "ko")
-        if not out and self.provider in ("deep", "auto_chain"):
-            if not self._can_call():
-                return None
-            self.calls_used += 1
-            if self.trace: print(f"[TX] deep_translator → {dest}: '{text}'")
-            out = _run_with_timeout(_try_deeptranslator, self.timeout, text, dest, "ko")
+            if self.trace:
+                print(f"[TX] papago → {dest_norm}: len={len(text)}")
+            try:
+                out = self.papago.translate(text, target=dest_norm, source="auto", honorific=self.papago_honorific)
+            except Exception as e:
+                _log_papago_error({
+                    "ts": now_local_str(), "status": None, "errorCode": "EXCEPTION",
+                    "errorMessage": f"TransCtl: {e}", "target": dest_norm, "src": "auto", "len": len(text),
+                    "headers_snippet": {}
+                }, trace=self.trace)
+                out = None
+
         if out:
             _trans_cache[key] = out
         return out
+
+# --------- 캐시 I/O ---------
 
 def load_trans_cache(path: Optional[str]):
     if not path: return
@@ -285,8 +513,9 @@ def load_trans_cache(path: Optional[str]):
         if isinstance(d, dict):
             for dest, m in d.items():
                 if not isinstance(m, dict): continue
+                dest_norm = norm_dest_lang(dest)
                 for norm_text, val in m.items():
-                    _trans_cache[(dest, norm_text)] = val
+                    _trans_cache[(dest_norm, norm_text)] = val
                     cnt += 1
         print(f"[CACHE] 번역 캐시 로드: {cnt}건 from {path}")
     except FileNotFoundError:
@@ -297,8 +526,8 @@ def load_trans_cache(path: Optional[str]):
 def save_trans_cache(path: Optional[str]):
     if not path: return
     out: Dict[str, Dict[str, str]] = {}
-    for (dest, norm_text), val in _trans_cache.items():
-        out.setdefault(dest, {})[norm_text] = val
+    for (dest_norm, norm_text), val in _trans_cache.items():
+        out.setdefault(dest_norm, {})[norm_text] = val
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
     except Exception:
@@ -471,9 +700,10 @@ def build_name_obj_region(ko: str, translate_mode: str,
     if not ko:
         return {"ko":"", "en":"", "cn":""}
 
+    # EN
     if translate_mode == "off":
         en = ""
-    elif translate_mode == "romanize" or transctl is None:
+    elif translate_mode == "romanize" or transctl is None or transctl.provider == "none":
         en = romanize_korean(ko) if has_hangul(ko) else ko
     else:
         if has_hangul(ko):
@@ -483,6 +713,7 @@ def build_name_obj_region(ko: str, translate_mode: str,
             en = ko
     en = titlecase_en(en)
 
+    # CN
     if translate_mode == "off":
         cn = ""
     else:
@@ -490,7 +721,7 @@ def build_name_obj_region(ko: str, translate_mode: str,
         if jeju_cn:
             cn = jeju_cn
         else:
-            if translate_mode == "romanize" or transctl is None:
+            if translate_mode == "romanize" or transctl is None or transctl.provider == "none":
                 cn = en if en else (romanize_korean(ko) if has_hangul(ko) else ko)
             else:
                 dest = "zh-TW" if zh_variant == "tw" else "zh-CN"
@@ -517,7 +748,7 @@ def build_name_obj_category(ko: str, translate_mode: str,
         if translate_mode == "off":
             en = en if en is not None else ""
             cn = cn if cn is not None else ""
-        elif translate_mode == "romanize" or transctl is None:
+        elif translate_mode == "romanize" or transctl is None or transctl.provider == "none":
             en_fb = romanize_korean(ko) if has_hangul(ko) else ko
             cn_fb = en_fb
             en = en if en is not None else en_fb
@@ -535,81 +766,67 @@ def build_name_obj_category(ko: str, translate_mode: str,
     en = titlecase_en(en or "")
     return {"ko": ko, "en": en, "cn": cn or ""}
 
-# ---------------- 시드 보강 (친절 로그 포함) ----------------
+# ---------------- 시드 병합 로직 ----------------
 
-def _pretty_seed(path: Optional[str]) -> str:
-    return path if path else "(none)"
+def _seed_take_top(items: List[Tuple[Any, int]], top_k: int, min_count: int) -> List[Tuple[Any,int]]:
+    items = [x for x in items if x[1] >= max(1, int(min_count or 1))]
+    items.sort(key=lambda x: (-x[1], str(x[0])))
+    if top_k and top_k > 0:
+        return items[:top_k]
+    return items
 
-def augment_glossary_from_category_seed(seed_path: str,
-                                        translate_mode: str,
-                                        transctl: Optional[TransCtl],
-                                        zh_variant: str,
-                                        top_k: int,
-                                        min_count: int) -> Tuple[int,int]:
-    """categories.json 시드에서 상위 토큰을 사전에 주입."""
+def merge_region_seed(addr_triplet_counter: Dict[Tuple[str,str,str], int],
+                      seed_path: Optional[str],
+                      top_k: int,
+                      min_count: int):
+    if not seed_path:
+        return
     data = read_json(seed_path)
     if not isinstance(data, list):
-        print(f"[SEED] category-seed 형식이 리스트가 아님 → skip", file=sys.stderr)
-        return (0,0)
-    # 정렬(빈도 내림차순) 후 top-k + min-count
-    rows = [x for x in data if isinstance(x, dict) and x.get("category")]
-    rows.sort(key=lambda x: (-int(x.get("count", 0)), str(x.get("category"))))
-    rows = [r for r in rows if int(r.get("count", 0)) >= int(min_count)]
-    rows = rows[: int(top_k)]
-    added = skipped = 0
-    for r in rows:
-        ko = str(r["category"]).strip()
-        if ko in CATEGORY_GLOSSARY_EN and ko in CATEGORY_GLOSSARY_CN:
-            skipped += 1
+        print(f"[SEED][REGION] 무시: 형식 오류 {seed_path}")
+        return
+    rows: List[Tuple[Tuple[str,str,str],int]] = []
+    for r in data:
+        if not isinstance(r, dict): continue
+        l1 = standardize_l1(normalize_jeju(r.get("l1") or ""))
+        l2 = _clean_ws(r.get("l2") or "")
+        l3 = _clean_ws(r.get("l3") or "")
+        try:
+            cnt = int(r.get("count") or 1)
+        except Exception:
+            cnt = 1
+        if not (l1 or l2 or l3):
             continue
-        nj = build_name_obj_category(ko, translate_mode, transctl, zh_variant)
-        if ko not in CATEGORY_GLOSSARY_EN and nj.get("en"):
-            CATEGORY_GLOSSARY_EN[ko] = nj["en"]
-        if ko not in CATEGORY_GLOSSARY_CN and nj.get("cn"):
-            CATEGORY_GLOSSARY_CN[ko] = nj["cn"]
-        added += 1
-    return (added, skipped)
+        rows.append(((l1,l2,l3), cnt))
+    picked = _seed_take_top(rows, top_k, min_count)
+    for (trip, cnt) in picked:
+        addr_triplet_counter[trip] += cnt
+    print(f"[SEED][REGION] 병합: src={seed_path} pick={len(picked)} / total={len(rows)} (min={min_count}, top_k={top_k})")
 
-def augment_jeju_from_region_seed(seed_path: str,
-                                  translate_mode: str,
-                                  transctl: Optional[TransCtl],
-                                  zh_variant: str,
-                                  top_k: int,
-                                  min_count: int) -> Tuple[int,int]:
-    """
-    regions-addr-unique.json 시드에서 l1/l2/l3 텍스트를 스캔해
-    JEJU_ZH_GLOSSARY_FULL_CN에 없으면 런타임 보강(속도/일관성 향상).
-    """
+def merge_category_seed(category_counter: Counter,
+                        seed_path: Optional[str],
+                        top_k: int,
+                        min_count: int):
+    if not seed_path:
+        return
     data = read_json(seed_path)
     if not isinstance(data, list):
-        print(f"[SEED] region-seed 형식이 리스트가 아님 → skip", file=sys.stderr)
-        return (0,0)
-    rows = [x for x in data if isinstance(x, dict)]
-    rows.sort(key=lambda x: (-int(x.get("count", 0)), str(x.get("l1","")), str(x.get("l2","")), str(x.get("l3",""))))
-    rows = [r for r in rows if int(r.get("count", 0)) >= int(min_count)]
-    rows = rows[: int(top_k)]
-
-    uniq_terms: List[str] = []
-    seen = set()
-    for r in rows:
-        for key in ("l1","l2","l3"):
-            t = (r.get(key) or "").strip()
-            if t and t not in seen:
-                seen.add(t); uniq_terms.append(t)
-
-    added = skipped = 0
-    for ko in uniq_terms:
-        if ko in JEJU_ZH_GLOSSARY_FULL_CN:
-            skipped += 1
-            continue
-        nj = build_name_obj_region(ko, translate_mode, transctl, zh_variant)
-        cn = nj.get("cn","")
-        if cn:
-            JEJU_ZH_GLOSSARY_FULL_CN[ko] = cn
-            added += 1
-        else:
-            skipped += 1
-    return (added, skipped)
+        print(f"[SEED][CAT] 무시: 형식 오류 {seed_path}")
+        return
+    rows: List[Tuple[str,int]] = []
+    for r in data:
+        if not isinstance(r, dict): continue
+        cat = _clean_ws(r.get("category") or r.get("cat") or "")
+        if not cat: continue
+        try:
+            cnt = int(r.get("count") or 1)
+        except Exception:
+            cnt = 1
+        rows.append((cat, cnt))
+    picked = _seed_take_top(rows, top_k, min_count)
+    for (cat, cnt) in picked:
+        category_counter[cat] += cnt
+    print(f"[SEED][CAT] 병합: src={seed_path} pick={len(picked)} / total={len(rows)} (min={min_count}, top_k={top_k})")
 
 # ---------------- 집계 처리 (+ 진행 로그) ----------------
 
@@ -648,6 +865,10 @@ def process_files(paths: List[str], dot_path: Optional[str], log_every: int,
                 continue
             rid = (it.get("v_rid") or "").strip()
 
+            # STEP: 현재 진행상황
+            done += 1
+            print(f"[STEP] {done}/{total_items} v_rid={rid or '-'}")
+
             addr = normalize_jeju(it.get("addr"))
             l1a,l2a,l3a = split_addr_3(addr) if addr else ("","","")
             regions_addr_per_shop.append({
@@ -669,7 +890,6 @@ def process_files(paths: List[str], dot_path: Optional[str], log_every: int,
             for tok in split_categories(it.get("category")):
                 category_counter[tok] += 1
 
-            done += 1
             if (done % le == 0) or (done == total_items):
                 elapsed = time.perf_counter() - t0
                 pct = (done / total_items * 100.0) if total_items else 100.0
@@ -829,7 +1049,7 @@ def main():
     # 진행 로그
     ap.add_argument("--log-every", type=int, default=100, help="N건마다 진행 상황 로그 출력 (기본 100)")
 
-    # 저장 옵션
+    # 저장
     ap.add_argument("--save-region", default="true", choices=["true","false"], help="지역 결과 저장 (기본 true)")
     ap.add_argument("--save-category", default="true", choices=["true","false"], help="카테고리 결과 저장 (기본 true)")
     ap.add_argument("--out-addr-triplets", default="data/region/regions-addr-triplets.json")
@@ -838,23 +1058,36 @@ def main():
     ap.add_argument("--out-road-unique", default="data/region/regions-road-addr-unique.json")
     ap.add_argument("--out-category", default="data/category/categories.json")
 
-    # 번역 옵션(지역적재와 동일)
+    # 번역 옵션 (Papago 고정)
     ap.add_argument("--translate", choices=["auto","romanize","off"], default="romanize")
     ap.add_argument("--translate-timeout", type=float, default=2.0)
-    ap.add_argument("--translate-max", type=int, default=200)
-    ap.add_argument("--translate-provider", choices=["auto_chain","googletrans","deep"], default="auto_chain")
+    ap.add_argument("--translate-max", type=int, default=0, help="≤0: 무제한 (기본 0)")
     ap.add_argument("--zh-variant", choices=["cn","tw"], default="cn")
     ap.add_argument("--trace-translate", action="store_true")
     ap.add_argument("--cache-file", default=None, help="번역 결과 캐시 JSON 경로")
 
-    # 🔹 시드 보강 옵션 (친절 로그 포함)
-    ap.add_argument("--region-seed", default=None, help="regions-addr-unique.json 경로 (옵션)")
-    ap.add_argument("--category-seed", default=None, help="categories.json 경로 (옵션)")
-    ap.add_argument("--seed-top-k", type=int, default=400, help="시드 상위 k개만 보강")
-    ap.add_argument("--seed-min-count", type=int, default=2, help="시드 최소 빈도")
-    ap.add_argument("--no-seed-augment", action="store_true", help="시드 보강 비활성화")
+    # Papago 설정/로그
+    ap.add_argument("--config", default="config.json", help="Papago 키(JSON) 경로")
+    ap.add_argument("--papago-honorific", type=str2bool, nargs="?", const=True, default=True,
+                    help="Papago 한국어 경어 옵션(true/false)")
+    ap.add_argument("--tx-error-log", default=".logs/papago_errors.json",
+                    help="Papago 실패 이벤트 JSON 로그 경로")
+
+    # 시드 옵션
+    ap.add_argument("--region-seed", default=None, help="regions-addr-unique.json 형식의 시드 파일")
+    ap.add_argument("--category-seed", default=None, help="seed-categories.json 형식의 시드 파일")
+    ap.add_argument("--seed-top-k", type=int, default=0, help="시드에서 count 상위 K개만 사용(0: 제한 없음)")
+    ap.add_argument("--seed-min-count", type=int, default=1, help="시드에서 count ≥ M 인 항목만 사용")
+
+    # 호환(무시)
+    ap.add_argument("--translate-provider", default=None,
+                    help="(deprecated) 무시됩니다. Papago 고정입니다.")
 
     args = ap.parse_args()
+
+    if args.translate_provider:
+        print(f"[WARN] --translate-provider 는 더 이상 사용하지 않습니다(Papago 고정). 입력값 '{args.translate_provider}'는 무시됩니다.")
+
     show = (args.show.lower() == "true")
     show_name = (args.show_name_json.lower() == "true")
     show_report = (args.show_region_report.lower() == "true")
@@ -862,55 +1095,39 @@ def main():
     do_save_category = (args.save_category.lower() == "true")
 
     # 번역 컨트롤러 + 캐시
+    tmax = None if args.translate_max is None or args.translate_max <= 0 else int(args.translate_max)
     transctl = None
     if args.translate == "auto":
         transctl = TransCtl(
-            provider=args.translate_provider,
+            use_papago=True,                    # 무조건 Papago
             timeout=args.translate_timeout,
-            max_calls=args.translate_max,
+            max_calls=tmax,                     # None이면 무제한
             zh_variant=args.zh_variant,
             trace=args.trace_translate,
+            config_path=args.config,
+            papago_honorific=args.papago_honorific,
         )
     load_trans_cache(args.cache_file)
-
-    # 🔹 부트스트랩 친절 로그 & 시드 보강
-    if args.no_seed_augment:
-        print("[SEED] augmentation disabled (--no-seed-augment)")
-    else:
-        # Region seed
-        if not (args.region_seed and os.path.exists(args.region_seed)):
-            print(f"[SEED] region-seed not found -> skip augment ({_pretty_seed(args.region_seed)})")
-        else:
-            a, s = augment_jeju_from_region_seed(
-                args.region_seed, args.translate, transctl, args.zh_variant,
-                args.seed_top_k, args.seed_min_count
-            )
-            print(f"[SEED] region-seed applied: added={a}, skipped={s} (src={args.region_seed})")
-        # Category seed
-        if not (args.category_seed and os.path.exists(args.category_seed)):
-            print(f"[SEED] category-seed not found -> skip augment ({_pretty_seed(args.category_seed)})")
-        else:
-            a, s = augment_glossary_from_category_seed(
-                args.category_seed, args.translate, transctl, args.zh_variant,
-                args.seed_top_k, args.seed_min_count
-            )
-            print(f"[SEED] category-seed applied: added={a}, skipped={s} (src={args.category_seed})")
 
     # 입력 파일
     files = gather_files(args.files or [])
     if not files:
         print("[ERR] 입력 파일이 없습니다.", file=sys.stderr)
-        end = time.perf_counter()
-        print(f"[TIME] 종료: {now_local_str()}")
-        print(f"[TIME] 총 소요: {end-start:.3f}s")
         save_trans_cache(args.cache_file)
+        _save_papago_errors(args.tx_error_log)
+        _print_papago_summary()
+        print(f"[TIME] 종료: {now_local_str()}")
         sys.exit(2)
 
-    # 집계 (진행 로그 포함)
+    # 집계 (STEP/PROG 로그 포함)
     (regions_addr_per_shop, regions_road_per_shop,
      addr_triplet_counter, road_triplet_counter, cat_counter) = process_files(
         files, args.path, args.log_every, transctl
     )
+
+    # ===== 시드 병합 =====
+    merge_region_seed(addr_triplet_counter, args.region_seed, args.seed_top_k, args.seed_min_count)
+    merge_category_seed(cat_counter, args.category_seed, args.seed_top_k, args.seed_min_count)
 
     # 화면 출력
     if show:
@@ -952,7 +1169,11 @@ def main():
         cat_list = [{"category": k, "count": v} for k,v in sorted(cat_counter.items(), key=lambda x:(-x[1], x[0]))]
         save_json(cat_list, args.out_category)
 
+    # 캐시/로그 마무리
     save_trans_cache(args.cache_file)
+    _save_papago_errors(args.tx_error_log)
+    _print_papago_summary()
+
     end = time.perf_counter()
     print(f"[TIME] 종료: {now_local_str()}")
     print(f"[TIME] 총 소요: {end-start:.3f}s")

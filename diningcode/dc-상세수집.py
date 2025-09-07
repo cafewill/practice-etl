@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-dc-상세수집.py — DiningCode 상세 수집기 (cache/dict/progress 옵션 포함)
+dc-상세수집.py — DiningCode 상세/메뉴 수집기
+- Papago 번역 + 캐시(HIT 시 API 생략, 로그 끝에 [CACHE] 표기)
+- 입력이 이미 목표언어면 Papago 호출 스킵(로그 끝에 [SKIP] 표기)
+- 400(N2MT05: source=target) → 원문 그대로 사용(IDENTITY) + 캐시 저장 + 진행 지속
+- 400일 때 RAW 응답 미리보기(콘솔) + JSON 로그(raw_body 최대 4KB)
+- translate_max 기본 무제한(≤0 이면 무제한)
+- 입력 파일별/전체 RID 수 표시 + 각 RID 처리 순번 로그([STEP] i/total)
 
-기능
-1) 메뉴 수집 → data/menu/[rid].json
-   - 항목: name | price_text | price_krw | recommended | name_json({"ko","en","cn"})
-   - name_json은 사전/토큰 매핑 → 자동번역(googletrans→deep_translator) → 로마자 폴백
-2) 상세 텍스트 수집 → data/detail/[rid].json
-   - name / name_json({"ko","en","cn"})              ✅
-   - description / description_json({"ko","en","cn"})
-   - short_description / short_description_json({"ko","en","cn"})
-
-CLI 옵션
-  --cache-file PATH        : 번역 캐시 파일 경로 (없어도 자동 생성)
-  --dict-mode off|exact|token  : 사전 적용 범위(기본 token)
-  --log-every N            : 진행 로그 주기
-  --translate auto|romanize|off, --zh-variant cn|tw, --trace-translate
+예시)
+python3 dc-상세수집.py \
+  --files "20250830-merged-list.json" \
+  --translate auto \
+  --translate-timeout 8.0 \
+  --translate-max 0 \
+  --zh-variant cn \
+  --config config.json \
+  --cache-file .cache/restaurant-trans.json \
+  --tx-error-log .logs/papago_errors.json \
+  --trace-translate true \
+  --show true
 """
 
+from __future__ import annotations
 import argparse
 import glob
 import json
@@ -28,15 +33,19 @@ import sys
 import time
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from collections import Counter
+from dataclasses import dataclass
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # -------------------- 정규식/유틸 --------------------
 PRICE_PAT = re.compile(r"([0-9][0-9,\.]*)\s*원")
 CLEAN_WS = re.compile(r"\s+")
 RE_HANGUL = re.compile(r"[가-힣]")
+RE_HAN = re.compile(r"[\u4E00-\u9FFF]")  # CJK Unified Ideographs
 
 def now_local_str() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z%z")
@@ -66,6 +75,37 @@ def _to_price_int(price_text: Optional[str]) -> Optional[int]:
 def _mk_url(rid: str) -> str:
     return f"https://www.diningcode.com/profile.php?rid={rid}"
 
+# === 라이트 언어 감지 및 대상 언어 정규화 ===
+def detect_lang_simple(text: str) -> str:
+    """
+    매우 가벼운 감지: 'ko'/'zh'/'en'/'unknown'
+    - 한글 있으면 'ko'
+    - 한자 있으면 'zh'
+    - 90% 이상 ASCII + 알파벳 존재하면 'en'
+    """
+    s = (text or "").strip()
+    if not s:
+        return "unknown"
+    if RE_HANGUL.search(s):
+        return "ko"
+    if RE_HAN.search(s):
+        return "zh"
+    ascii_cnt = sum(1 for ch in s if ord(ch) < 128)
+    alpha_cnt = sum(1 for ch in s if ch.isalpha())
+    if ascii_cnt >= max(1, int(len(s) * 0.9)) and alpha_cnt > 0:
+        return "en"
+    return "unknown"
+
+def norm_dest_lang(dest: str) -> str:
+    d = (dest or "").lower().replace("_", "-")
+    if d in ("en", "english"):
+        return "en"
+    if d in ("cn", "zh", "zh-cn", "zh-hans"):
+        return "zh-CN"
+    if d in ("tw", "zh-tw", "zh-hant"):
+        return "zh-TW"
+    return dest
+
 # -------------------- 파일에서 v_rid 수집 --------------------
 def _iter_dicts(x: Any) -> Iterable[Dict[str, Any]]:
     if isinstance(x, dict):
@@ -77,6 +117,7 @@ def _iter_dicts(x: Any) -> Iterable[Dict[str, Any]]:
             yield from _iter_dicts(it)
 
 def collect_vrids_from_file(path: str) -> List[str]:
+    """입력 JSON 내 모든 위치에서 v_rid를 모아 반환."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             doc = json.load(f)
@@ -90,8 +131,7 @@ def collect_vrids_from_file(path: str) -> List[str]:
         if isinstance(rid, str):
             rid = rid.strip()
         if isinstance(rid, str) and rid and rid not in seen:
-            seen.add(rid)
-            vrids.append(rid)
+            seen.add(rid); vrids.append(rid)
     return vrids
 
 def gather_files(patterns: List[str]) -> List[str]:
@@ -104,7 +144,20 @@ def gather_files(patterns: List[str]) -> List[str]:
             uniq.append(p); seen.add(p)
     return uniq
 
-# -------------------- 웹 요청 / 파서 --------------------
+# -------------------- HTTP --------------------
+def _requests_session(timeout: float = 8.0) -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.3,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+    s.request_timeout = timeout
+    return s
+
 def fetch_html(url: str, timeout: float = 8.0) -> str:
     headers = {
         "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -117,6 +170,7 @@ def fetch_html(url: str, timeout: float = 8.0) -> str:
     r.raise_for_status()
     return r.text
 
+# -------------------- 파서 --------------------
 def parse_store_name(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
     el = soup.select_one("div.tit-point h1.tit") or soup.select_one("h1.tit")
@@ -229,7 +283,7 @@ def compose_short_description(btxt: List[str], tags: List[str]) -> str:
     if tags: parts.append(", ".join(tags))
     return _clean(" | ".join([p for p in parts if p.strip()]))
 
-# -------------------- 번역/캐시/로마자 --------------------
+# -------------------- 번역/로마자/캐시 --------------------
 def _norm_key(s: str) -> str:
     return CLEAN_WS.sub(" ", (s or "").strip()).lower()
 
@@ -238,8 +292,8 @@ _V = ["a","ae","ya","yae","eo","e","yeo","ye","o","wa","wae","oe","yo","u","wo",
 _T = ["","k","k","ks","n","nj","nh","t","l","lk","lm","lb","ls","lt","lp","lh","m","p","ps","t","t","ng","t","t","k","t","p","t"]
 
 _roman_cache: Dict[str, str] = {}
+# 캐시 키는 (norm_dest_lang(dest), _norm_key(text))
 _trans_cache: Dict[Tuple[str, str], str] = {}
-_mljson_cache: Dict[Tuple[str, str, str], Dict[str, str]] = {}
 
 def has_hangul(s: str) -> bool:
     return bool(RE_HANGUL.search(s or ""))
@@ -264,100 +318,302 @@ def romanize_korean(text: str) -> str:
     _roman_cache[key] = res
     return res
 
-def _try_googletrans(text: str, dest: str, src: str = "ko") -> Optional[str]:
-    try:
-        from googletrans import Translator  # type: ignore
-        tr = Translator()
-        res = tr.translate(text, src=src, dest=dest)
-        return res.text if getattr(res, "text", None) else None
-    except Exception:
-        return None
+# -------------------- Papago 에러 로깅/통계 --------------------
+PAPAGO_ERRORS: List[Dict[str, Any]] = []
+PAPAGO_STATS = {"ok": 0, "err": 0, "codes": Counter(), "ecodes": Counter()}
 
-def _try_deeptranslator(text: str, dest: str, src: str = "ko") -> Optional[str]:
-    try:
-        from deep_translator import GoogleTranslator  # type: ignore
-        tr = GoogleTranslator(source=src, target=dest)
-        return tr.translate(text)
-    except Exception:
-        return None
+def _log_papago_error(event: Dict[str, Any], trace: bool):
+    """event: {ts,status,errorCode,errorMessage,target,src,len,headers_snippet,raw_body?}"""
+    PAPAGO_ERRORS.append(event)
+    PAPAGO_STATS["err"] += 1
+    if event.get("status") is not None:
+        PAPAGO_STATS["codes"][str(event["status"])] += 1
+    ecode = event.get("errorCode")
+    if ecode:
+        PAPAGO_STATS["ecodes"][str(ecode)] += 1
+    if trace:
+        status = event.get("status")
+        ecode = event.get("errorCode")
+        emsg  = event.get("errorMessage")
+        remain = event.get("headers_snippet", {}).get("x-ratelimit-remaining") or \
+                 event.get("headers_snippet", {}).get("x-ratelimit-remaining-minute")
+        print(f"[TX][papago][ERR] status={status} ecode={ecode} remain={remain} msg={emsg}")
 
-def _run_with_timeout(fn, timeout_sec: float, *args, **kwargs) -> Optional[str]:
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(fn, *args, **kwargs)
+def _log_papago_ok():
+    PAPAGO_STATS["ok"] += 1
+
+def _print_papago_summary():
+    if PAPAGO_STATS["ok"] + PAPAGO_STATS["err"] == 0:
+        return
+    print("\n[TX][papago] 요약")
+    print(f"  - 성공 OK: {PAPAGO_STATS['ok']}")
+    print(f"  - 실패 ERR: {PAPAGO_STATS['err']}")
+    if PAPAGO_STATS["codes"]:
+        print("  - HTTP 상태코드별:", dict(PAPAGO_STATS["codes"].most_common()))
+    if PAPAGO_STATS["ecodes"]:
+        print("  - 에러코드별:", dict(PAPAGO_STATS["ecodes"].most_common()))
+    if PAPAGO_ERRORS:
+        print("  - 대표 에러 예시(최신 3건):")
+        for ev in PAPAGO_ERRORS[-3:]:
+            print(f"    • ts={ev.get('ts')} status={ev.get('status')} "
+                  f"ecode={ev.get('errorCode')} msg={ev.get('errorMessage')} "
+                  f"len={ev.get('len')} target={ev.get('target')}")
+
+def _save_papago_errors(path: Optional[str]):
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(PAPAGO_ERRORS, f, ensure_ascii=False, indent=2)
+        print(f"[TX][papago] 에러 로그 저장 → {path} ({len(PAPAGO_ERRORS)}건)")
+    except Exception as e:
+        print(f"[TX][papago] 에러 로그 저장 실패: {e}", file=sys.stderr)
+
+# -------------------- Papago 클라이언트 --------------------
+class PapagoClient:
+    PAPAGO_URL = "https://papago.apigw.ntruss.com/nmt/v1/translation"
+
+    def __init__(self, config_path: str = "config.json", timeout: float = 8.0, trace: bool = False):
+        self.timeout = timeout
+        self.trace = trace
+        self.session = _requests_session(timeout=timeout)
+        self.headers = self._load_headers(config_path)
+
+    @staticmethod
+    def _load_headers(config_path: str) -> Dict[str, str]:
         try:
-            return fut.result(timeout=timeout_sec)
-        except FuturesTimeout:
-            return None
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
         except Exception:
-            return None
+            cfg = {}
+        client_id = cfg.get("PAPAGO_CLIENT_ID") or cfg.get("X-NCP-APIGW-API-KEY-ID") or ""
+        client_secret = cfg.get("PAPAGO_CLIENT_SECRET") or cfg.get("X-NCP-APIGW-API-KEY") or ""
+        return {
+            "X-NCP-APIGW-API-KEY-ID": client_id,
+            "X-NCP-APIGW-API-KEY": client_secret,
+            "Content-Type": "application/json",
+        }
 
+    @staticmethod
+    def _normalize_lang(code: str) -> str:
+        if not code:
+            return "en"
+        c = code.replace("_", "-").lower()
+        mapping = {
+            "cn": "zh-CN", "zh": "zh-CN", "zh-cn": "zh-CN", "zh-hans": "zh-CN",
+            "tw": "zh-TW", "zh-tw": "zh-TW", "zh-hant": "zh-TW"
+        }
+        out = mapping.get(c, code)
+        out = out.replace("_", "-")
+        if out.lower() == "zh-cn": return "zh-CN"
+        if out.lower() == "zh-tw": return "zh-TW"
+        return out
+
+    def _parse_error_payload(self, obj: Any) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Papago 오류 응답은 케이스별로 형태가 다름:
+          - {"error":{"errorCode":"N2MT05","message":"..."}}  ← 샘플
+          - {"errorCode":"...", "errorMessage":"..."}
+        안전하게 errorCode, errorMessage를 뽑아줌.
+        """
+        code = msg = None
+        if isinstance(obj, dict):
+            if "error" in obj and isinstance(obj["error"], dict):
+                code = obj["error"].get("errorCode")
+                msg = obj["error"].get("message") or obj["error"].get("errorMessage")
+            code = code or obj.get("errorCode")
+            msg = msg or obj.get("errorMessage")
+        return code, msg
+
+    def translate(self, text: str, target: str, source: str = "auto", honorific: bool = True) -> str:
+        if text is None:
+            return ""
+        payload = {
+            "source": source or "auto",
+            "target": self._normalize_lang(target),
+            "text": str(text),
+            "honorific": "true" if honorific else "false",
+        }
+        try:
+            r = self.session.post(self.PAPAGO_URL, headers=self.headers, json=payload, timeout=self.timeout)
+            status = r.status_code
+
+            # ── 성공 ──────────────────────────────────────────────────────────
+            if status == 200:
+                try:
+                    data = r.json()
+                    out = (data.get("message", {}).get("result", {}).get("translatedText") or "").strip()
+                except Exception:
+                    out = ""
+                if out:
+                    _log_papago_ok()
+                    if self.trace:
+                        print(f"[TX][papago][OK] len={len(text)} → {payload['target']}")
+                    return out
+                # 200인데 결과 없음
+                event = {
+                    "ts": now_local_str(), "status": status, "errorCode": "EMPTY_RESULT",
+                    "errorMessage": "translatedText empty", "target": payload["target"],
+                    "src": payload["source"], "len": len(text),
+                    "headers_snippet": {k.lower(): v for k, v in r.headers.items() if k.lower().startswith("x-")}
+                }
+                _log_papago_error(event, self.trace)
+                return ""
+
+            # ── 실패(400/401/403/429/5xx 등) ──────────────────────────────────
+            err_json, err_text = {}, ""
+            try:
+                err_json = r.json()
+            except Exception:
+                err_text = r.text
+
+            # 안전 파싱
+            ecode, emsg = self._parse_error_payload(err_json)
+
+            # 400 전용: RAW 본문 미리보기 + JSON 로그 raw_body 저장
+            RAW_MAX = 4096
+            raw_body = None
+            if status == 400:
+                raw_body = (r.text or "")[:RAW_MAX]
+                preview = raw_body[:600].replace("\n", " ")
+                print(f"[TX][papago][400] target={payload['target']} len={len(text)} RAW({len(raw_body)}B) = {preview}")
+
+                # N2MT05: source=target → 원문 그대로 반환, 에러로 집계하지 않음(진행 지속)
+                blob = (preview or "").lower()
+                if (ecode == "N2MT05") or ("source and target must be different" in blob):
+                    if self.trace:
+                        print(f"[TX][papago][IDENTITY] source==target; return original (len={len(text)})")
+                    _log_papago_ok()  # OK 집계로 처리
+                    return text
+
+            # 그 외 에러: 집계/저장
+            event = {
+                "ts": now_local_str(), "status": status,
+                "errorCode": ecode,
+                "errorMessage": emsg if emsg else (err_text[:400] if err_text else None),
+                "target": payload["target"], "src": payload["source"], "len": len(text),
+                "headers_snippet": {k.lower(): v for k, v in r.headers.items() if k.lower().startswith("x-")}
+            }
+            if raw_body is not None:
+                event["raw_body"] = raw_body
+
+            _log_papago_error(event, self.trace)
+            return ""
+
+        except Exception as e:
+            event = {
+                "ts": now_local_str(), "status": None, "errorCode": "EXCEPTION",
+                "errorMessage": str(e), "target": payload["target"], "src": payload["source"], "len": len(text),
+                "headers_snippet": {}
+            }
+            _log_papago_error(event, self.trace)
+            return ""
+
+# -------------------- 번역 컨트롤 --------------------
 class TransCtl:
-    def __init__(self, provider: str, timeout: float, max_calls: int, zh_variant: str, trace: bool = False):
+    """
+    provider:
+      - "papago"     : Papago 호출
+      - "googletrans": 레거시(옵션)
+      - "deep"       : 레거시(옵션)
+      - "auto_chain" : googletrans→deep 폴백(레거시)
+      - "none"       : 외부 번역 미사용
+    """
+    def __init__(self,
+                 provider: str,
+                 timeout: float,
+                 max_calls: Optional[int],
+                 zh_variant: str,
+                 trace: bool = False,
+                 config_path: str = "config.json",
+                 papago_honorific: bool = True):
         self.provider = provider
         self.timeout = timeout
-        self.max_calls = max_calls
+        self.max_calls = max_calls  # None이면 무제한
         self.calls_used = 0
         self.zh_variant = "zh-TW" if zh_variant == "tw" else "zh-CN"
         self.trace = trace
 
+        self.papago_honorific = papago_honorific
+        self.papago = PapagoClient(config_path=config_path, timeout=timeout, trace=trace) if provider == "papago" else None
+
     def _can_call(self) -> bool:
-        return self.max_calls is None or self.calls_used < self.max_calls
+        return (self.max_calls is None) or (self.calls_used < self.max_calls)
 
     def translate(self, text: str, dest: str) -> Optional[str]:
-        key = (dest, _norm_key(text))
+        # --- 캐시 조회(정규화된 대상언어 + 정규화 텍스트) ---
+        dest_norm = norm_dest_lang(dest)
+        key = (dest_norm, _norm_key(text))
         if key in _trans_cache:
+            if self.trace:
+                # 캐시 사용을 OK 라인 포맷으로, 우측에 [CACHE] 태그
+                print(f"[TX][papago][OK] len={len(text)} → {dest_norm} [CACHE]")
             return _trans_cache[key]
+
+        # --- 사전 스킵(입력언어 = 타깃언어) ---
+        lang = detect_lang_simple(text)
+        if (dest_norm == "en" and lang == "en") or \
+           (dest_norm in ("zh-CN", "zh-TW") and lang == "zh"):
+            if self.trace:
+                # 스킵도 OK 포맷으로 표기하여 흐름 일관성 유지, 우측 [SKIP]
+                print(f"[TX][papago][OK] len={len(text)} → {dest_norm} [SKIP]")
+            _log_papago_ok()  # 성공으로 간주
+            _trans_cache[key] = text  # 캐시에 저장하여 이후 호출 생략
+            return text
+
+        # 호출 한도 체크(기본 무제한)
         if not self._can_call():
+            if self.trace:
+                print(f"[TX] translate_max reached ({self.max_calls}); further texts will be kept as original.")
             return None
 
         out: Optional[str] = None
-        if self.provider in ("googletrans", "auto_chain"):
+
+        # 1) Papago
+        if self.provider == "papago":
             self.calls_used += 1
-            if self.trace: print(f"[TX] googletrans → {dest}: {text!r}")
-            out = _run_with_timeout(_try_googletrans, self.timeout, text, dest, "ko")
+            if self.trace: print(f"[TX] papago → {dest_norm}: len={len(text)}")
+            try:
+                out = self.papago.translate(text, target=dest_norm, source="auto", honorific=self.papago_honorific)
+            except Exception as e:
+                _log_papago_error({
+                    "ts": now_local_str(), "status": None, "errorCode": "EXCEPTION",
+                    "errorMessage": f"TransCtl: {e}", "target": dest_norm, "src": "auto", "len": len(text),
+                    "headers_snippet": {}
+                }, trace=self.trace)
+                out = None
+
+        # 2) 레거시 제공자 (옵션 유지)
+        if not out and self.provider in ("googletrans", "auto_chain"):
+            self.calls_used += 1
+            if self.trace: print(f"[TX] googletrans → {dest_norm}: len={len(text)}")
+            try:
+                from googletrans import Translator  # type: ignore
+                tr = Translator()
+                res = tr.translate(text, src="ko", dest=dest_norm)
+                out = res.text if getattr(res, "text", None) else None
+            except Exception:
+                out = None
+
         if not out and self.provider in ("deep", "auto_chain"):
             if not self._can_call():
                 return None
             self.calls_used += 1
-            if self.trace: print(f"[TX] deep_translator → {dest}: {text!r}")
-            out = _run_with_timeout(_try_deeptranslator, self.timeout, text, dest, "ko")
+            if self.trace: print(f"[TX] deep_translator → {dest_norm}: len={len(text)}")
+            try:
+                from deep_translator import GoogleTranslator  # type: ignore
+                tr = GoogleTranslator(source="ko", target=dest_norm)
+                out = tr.translate(text)
+            except Exception:
+                out = None
 
         if out:
-            _trans_cache[key] = out
+            _trans_cache[key] = out  # 성공/IDENTITY 결과 모두 캐시에 저장됨
         return out
-
-# 캐시 파일 입출력
-def load_trans_cache(path: Optional[str]):
-    if not path: return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        cnt = 0
-        if isinstance(data, dict):
-            for dest, m in data.items():
-                if not isinstance(m, dict): continue
-                for norm_text, val in m.items():
-                    _trans_cache[(dest, norm_text)] = val
-                    cnt += 1
-        print(f"[CACHE] 로드: {cnt}건 from {path}")
-    except FileNotFoundError:
-        print(f"[CACHE] 파일 없음(신규 생성 예정): {path}")
-    except Exception as e:
-        print(f"[CACHE] 로드 실패({e}) — 무시")
-
-def save_trans_cache(path: Optional[str]):
-    if not path: return
-    out: Dict[str, Dict[str, str]] = {}
-    for (dest, norm_text), val in _trans_cache.items():
-        out.setdefault(dest, {})[norm_text] = val
-    try:
-        d = os.path.dirname(path)
-        if d: os.makedirs(d, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
-        print(f"[CACHE] 저장: {len(_trans_cache)}건 -> {path}")
-    except Exception as e:
-        print(f"[CACHE] 저장 실패({e}) — 무시")
 
 # -------------------- EN TitleCase / CN 번체 처리 --------------------
 CN_TO_TW_TABLE = str.maketrans({
@@ -378,7 +634,7 @@ def titlecase_en(s: str) -> str:
         return tok[:1].upper() + tok[1:]
     return "".join(cap(p) for p in parts)
 
-# -------------------- 용어 사전 (요약) --------------------
+# -------------------- 용어 사전 --------------------
 TERM_DICT: Dict[str, Tuple[str, str]] = {
     "카페": ("Cafe", "咖啡店"),
     "아이스크림": ("Ice Cream", "冰淇淋"),
@@ -407,256 +663,121 @@ def dict_lookup(ko: str, zh_variant: str) -> Tuple[Optional[str], Optional[str]]
     en, cn = pair
     return (titlecase_en(en), to_tw_if_needed(cn, zh_variant))
 
-def slash_lookup(ko: str, zh_variant: str) -> Tuple[Optional[str], Optional[str]]:
-    if "/" not in ko: return (None, None)
-    parts = [p.strip() for p in ko.split("/")]
-    en_parts, cn_parts = [], []
-    for p in parts:
-        en_p, cn_p = dict_lookup(p, zh_variant)
-        en_parts.append(en_p or p)
-        cn_parts.append(cn_p or p)
-    en = " / ".join(titlecase_en(x) for x in en_parts)
-    cn = " / ".join(cn_parts)
-    return (en, to_tw_if_needed(cn, zh_variant))
+def _split_tokens_for_dict(s: str) -> List[str]:
+    parts = re.split(r"[,\|/·•⋯\s]+", s or "")
+    return [p for p in (t.strip() for t in parts) if p]
 
-def token_map(ko: str, zh_variant: str) -> Tuple[str, str, bool]:
-    if not ko: return ("", "", False)
-    toks = re.split(r"([ +\-])", ko)
-    en_out, cn_out, replaced = [], [], False
-    for t in toks:
-        if t in (" ", "+", "-"):
-            en_out.append(t); cn_out.append(t); continue
-        en_t, cn_t = dict_lookup(t, zh_variant)
-        if en_t or cn_t: replaced = True
-        en_out.append(en_t or t)
-        cn_out.append(cn_t or t)
-    en_res = titlecase_en("".join(en_out))
-    cn_res = to_tw_if_needed("".join(cn_out), zh_variant)
-    return (en_res, cn_res, replaced)
+def ml_with_dict(ko_text: str,
+                 translate_mode: str,
+                 transctl: Optional[TransCtl],
+                 zh_variant_cli: str,
+                 dict_mode: str = "token") -> Dict[str, str]:
+    ko = ko_text or ""
+    zh_var = "tw" if (transctl and transctl.zh_variant == "zh-TW") else "cn"
 
-def ml_with_dict(ko: str, translate_mode: str, transctl: Optional[TransCtl],
-                 zh_variant: str, dict_mode: str = "token") -> Dict[str, str]:
-    ko = (ko or "").strip()
-    if not ko:
-        return {"ko":"", "en":"", "cn":""}
+    # 외부 번역 미사용 모드
+    if translate_mode in ("off", "romanize") or not transctl or transctl.provider == "none":
+        en = romanize_korean(ko) if translate_mode == "romanize" else ko
+        cn = ko
+        return {"ko": ko, "en": en, "cn": cn}
 
-    # exact
-    en_d, cn_d = dict_lookup(ko, zh_variant)
-    if en_d or cn_d:
-        return {"ko": ko, "en": en_d or "", "cn": cn_d or ""}
+    if dict_mode == "exact":
+        en_d, cn_d = dict_lookup(ko, zh_var)
+        if en_d or cn_d:
+            en = en_d or (transctl.translate(ko, "en") or ko)
+            cn_raw = cn_d or (transctl.translate(ko, transctl.zh_variant) or ko)
+            cn = to_tw_if_needed(cn_raw, zh_var)
+            return {"ko": ko, "en": en or ko, "cn": cn or ko}
 
-    # slash
-    en_s, cn_s = slash_lookup(ko, zh_variant)
-    if en_s or cn_s:
-        return {"ko": ko, "en": en_s or "", "cn": cn_s or ""}
-
-    # token
+    en_tok: List[str] = []
+    cn_tok: List[str] = []
+    used = False
     if dict_mode == "token":
-        en_t, cn_t, replaced = token_map(ko, zh_variant)
-        if replaced:
-            return {"ko": ko, "en": en_t, "cn": cn_t}
+        for tk in _split_tokens_for_dict(ko):
+            en_d, cn_d = dict_lookup(tk, zh_var)
+            if en_d or cn_d:
+                used = True
+            en_tok.append(en_d or tk)
+            cn_tok.append(cn_d or tk)
 
-    # fallback — 일반 번역
-    base = build_ml_json(ko, translate_mode, transctl)
-    return {"ko": ko, "en": base.get("en",""), "cn": base.get("cn","")}
+    if dict_mode == "token" and used:
+        en = " ".join(en_tok)
+        cn_raw = " ".join(cn_tok)
+        cn = to_tw_if_needed(cn_raw, zh_var)
+        return {"ko": ko, "en": en or ko, "cn": cn or ko}
 
-# 일반 텍스트 → (ko,en,cn)
-def build_ml_json(ko: str, translate_mode: str, transctl: Optional[TransCtl]) -> Dict[str, str]:
-    ko = (ko or "").strip()
-    if not ko:
-        return {"ko": "", "en": "", "cn": ""}
+    # 사전 미적용 → 기계번역 (캐시 활용은 TransCtl에서 자동 처리)
+    en = transctl.translate(ko, "en") or ko
+    cn_raw = transctl.translate(ko, transctl.zh_variant) or ko
+    cn = to_tw_if_needed(cn_raw, zh_var)
+    return {"ko": ko, "en": en or ko, "cn": cn or ko}
 
-    key = (_norm_key(ko), translate_mode, getattr(transctl, "zh_variant", "zh-CN"))
-    if key in _mljson_cache:
-        c = _mljson_cache[key]
-        return {"ko": ko, "en": c.get("en",""), "cn": c.get("cn","")}
+def build_ml_json(ko_text: str, translate_mode: str, transctl: Optional[TransCtl]) -> Dict[str, str]:
+    if translate_mode in ("off", "romanize") or not transctl or transctl.provider == "none":
+        en = romanize_korean(ko_text) if translate_mode == "romanize" else ko_text
+        cn = ko_text
+        return {"ko": ko_text, "en": en, "cn": cn}
+    en = transctl.translate(ko_text, "en") or ko_text
+    cn = transctl.translate(ko_text, transctl.zh_variant) or ko_text
+    return {"ko": ko_text, "en": en, "cn": cn}
 
-    if translate_mode == "off":
-        res = {"ko": ko, "en": "", "cn": ""}
-        _mljson_cache[key] = res
-        return res
+def build_name_ml_json(name: str, translate_mode: str, transctl: Optional[TransCtl], zh_variant_cli: str) -> Dict[str, str]:
+    return ml_with_dict(name, translate_mode, transctl, zh_variant_cli, dict_mode="token")
 
-    if translate_mode == "romanize" or transctl is None:
-        en = romanize_korean(ko) if has_hangul(ko) else ko
-        cn = en
-        res = {"ko": ko, "en": en, "cn": cn}
-        _mljson_cache[key] = res
-        return res
+# -------------------- 파일 저장 --------------------
+def _ensure_dir(p: str):
+    d = os.path.dirname(p)
+    if d: os.makedirs(d, exist_ok=True)
 
-    en = ""
-    cn = ""
-    if has_hangul(ko):
-        t_en = transctl.translate(ko, "en")
-        en = (t_en or "").strip()
-    else:
-        en = ko
-    if not en or has_hangul(en):
-        en = romanize_korean(ko)
-    t_cn = transctl.translate(ko, transctl.zh_variant) if has_hangul(ko) else None
-    cn = (t_cn or "").strip() if t_cn else ""
-    if not cn or has_hangul(cn):
-        cn = en
-    res = {"ko": ko, "en": titlecase_en(en), "cn": to_tw_if_needed(cn, "tw" if getattr(transctl, "zh_variant", "zh-CN")=="zh-TW" else "cn")}
-    _mljson_cache[key] = res
-    return res
-
-# 상호명 전용
-def build_name_ml_json(ko_name: str, translate_mode: str, transctl: Optional[TransCtl], zh_variant: str) -> Dict[str, str]:
-    ko_name = (ko_name or "").strip()
-    if not ko_name:
-        return {"ko":"", "en":"", "cn":""}
-
-    if translate_mode == "off":
-        return {"ko": ko_name, "en": "", "cn": ""}
-
-    if translate_mode == "romanize" or transctl is None:
-        en = titlecase_en(romanize_korean(ko_name) if has_hangul(ko_name) else ko_name)
-        return {"ko": ko_name, "en": en, "cn": en}
-
-    t_en = transctl.translate(ko_name, "en") or ""
-    t_cn = transctl.translate(ko_name, transctl.zh_variant) or ""
-    if not t_en or has_hangul(t_en):
-        t_en = romanize_korean(ko_name)
-    if not t_cn or has_hangul(t_cn):
-        t_cn = t_en
-    t_en = titlecase_en(t_en.strip())
-    t_cn = to_tw_if_needed(t_cn.strip(), zh_variant)
-    return {"ko": ko_name, "en": t_en, "cn": t_cn}
-
-# -------------------- 표시/저장 --------------------
-def _namejson_str(v: Any) -> str:
-    if isinstance(v, dict):
-        return json.dumps(v, ensure_ascii=False, separators=(",",":"))
-    if isinstance(v, str):
-        return v
-    return ""
-
-def print_menu_table(rows: List[Dict[str, Any]]):
-    if not rows:
-        print("(수집된 메뉴 없음)")
-        return
-    cols = ["name", "price_text", "price_krw", "recommended", "name_json"]
-    def w(col, cap):
-        vals = []
-        for r in rows:
-            x = r.get(col, "")
-            if col == "name_json": x = _namejson_str(x)
-            vals.append(len(str(x)))
-        mx = max([len(col)] + vals)
-        return min(max(6, mx), cap)
-    widths = {
-        "name": w("name", 40),
-        "price_text": w("price_text", 10),
-        "price_krw": w("price_krw", 10),
-        "recommended": w("recommended", 11),
-        "name_json": w("name_json", 70),
-    }
-    header = " | ".join(c.ljust(widths[c]) for c in cols)
-    print(header)
-    print("-" * len(header))
-    for r in rows:
-        cells = []
-        for c in cols:
-            v = r.get(c, "")
-            if c == "name_json": v = _namejson_str(v)
-            cells.append(str(v).ljust(widths[c]))
-        print(" | ".join(cells))
-
-def save_json(rows: List[Dict[str, Any]], path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def save_json(path: str, data: Dict[str, Any]):
+    _ensure_dir(path)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
-    print(f"[OK] 저장: {path} ({len(rows)}건)")
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def save_text_json(
-    rid: str,
-    url: str,
-    name: str,
-    name_json: Dict[str, str],
-    textinfo: Dict[str, List[str]],
-    description: str,
-    description_json: Dict[str, str],
-    short_description: str,
-    short_description_json: Dict[str, str],
-    path: str
-):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    payload = {
-        "v_rid": rid,
-        "url": url,
-        "name": name,
-        "name_json": name_json,  # {"ko","en","cn"}
-        "btxt": textinfo.get("btxt", []),
-        "tags": textinfo.get("tags", []),
-        "chars": textinfo.get("chars", []),
-        "description": description,
-        "description_json": description_json,
-        "short_description": short_description,
-        "short_description_json": short_description_json,
-        "fetched_at": now_local_str(),
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(f"[OK] 텍스트 저장: {path} (name:'{name}', btxt:{len(payload['btxt'])}, tags:{len(payload['tags'])}, chars:{len(payload['chars'])})")
-
-def print_textinfo(payload: Dict[str, Any]):
-    print("[TEXT]")
-    print(f"  url        : {payload.get('url','')}")
-    print(f"  name       : {payload.get('name','')}")
+# -------------------- 업그레이드(기존 메뉴 파일에 name_json 채움) --------------------
+def upgrade_existing_menu_file(menu_path: str,
+                               translate_mode: str,
+                               transctl: Optional[TransCtl],
+                               zh_variant: str,
+                               dict_mode: str = "token") -> bool:
     try:
-        nj = json.dumps(payload.get('name_json', {}), ensure_ascii=False, separators=(",",":"))
-    except Exception:
-        nj = str(payload.get('name_json', {}))
-    print(f"  name_json  : {nj}")
-    print(f"  btxt({len(payload.get('btxt',[]))}): { ' | '.join(payload.get('btxt',[])) }")
-    print(f"  tags({len(payload.get('tags',[]))}): { ', '.join(payload.get('tags',[])) }")
-    print(f"  chars({len(payload.get('chars',[]))}): { ', '.join(payload.get('chars',[])) }")
-    print(f"  description: {payload.get('description','')}")
-    try:
-        dj = json.dumps(payload.get('description_json', {}), ensure_ascii=False, separators=(",",":"))
-    except Exception:
-        dj = str(payload.get('description_json', {}))
-    print(f"  description_json     : {dj}")
-    print(f"  short_description    : {payload.get('short_description','')}")
-    try:
-        sdj = json.dumps(payload.get('short_description_json', {}), ensure_ascii=False, separators=(",",":"))
-    except Exception:
-        sdj = str(payload.get('short_description_json', {}))
-    print(f"  short_description_json: {sdj}")
-
-# -------------------- 업그레이드(메뉴 파일 보강) --------------------
-def upgrade_existing_menu_file(path: str, translate_mode: str, transctl: Optional[TransCtl],
-                               zh_variant: str, dict_mode: str) -> bool:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(menu_path, "r", encoding="utf-8") as f:
             rows = json.load(f)
-    except Exception as e:
-        print(f"[WARN] 업그레이드용 기존 메뉴 파일 읽기 실패: {e}", file=sys.stderr)
+    except Exception:
         return False
-
     changed = False
-    if isinstance(rows, list):
-        for r in rows:
-            if not isinstance(r, dict): continue
-            nj = r.get("name_json")
-            if not (isinstance(nj, dict) and nj.get("ko") and "cn" in nj):
-                r["name_json"] = ml_with_dict(r.get("name",""), translate_mode, transctl, zh_variant, dict_mode=dict_mode)
-                changed = True
-
+    for r in rows if isinstance(rows, list) else []:
+        if "name" in r and not r.get("name_json"):
+            r["name_json"] = ml_with_dict(r.get("name",""), translate_mode, transctl, zh_variant, dict_mode=dict_mode)
+            changed = True
     if changed:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(rows, f, ensure_ascii=False, indent=2)
-        print(f"[OK] 업그레이드 저장(메뉴 보강): {path} ({len(rows)}건)")
-    else:
-        print(f"[OK] 업그레이드 필요 없음(메뉴): {path}")
+        save_json(menu_path, rows)
     return changed
 
-# -------------------- 메인 --------------------
-def main():
-    start_perf = time.perf_counter()
-    print(f"[TIME] 시작: {now_local_str()}")
+# -------------------- CLI/Args --------------------
+@dataclass
+class Args:
+    files: List[str]
+    timeout: float
+    sleep: float
+    force: bool
+    upgrade: bool
+    show: bool
+    translate: str
+    translate_timeout: float
+    translate_max: Optional[int]  # None이면 무제한
+    translate_provider: str
+    zh_variant: str
+    trace_translate: bool
+    config: str
+    cache_file: Optional[str]
+    log_every: int
+    papago_honorific: bool
+    tx_error_log: Optional[str]
+    dict_mode: str
 
-    ap = argparse.ArgumentParser(description="DiningCode 메뉴/상세 수집기 (이름 번역/캐시/사전 지원)")
+def parse_args() -> Args:
+    ap = argparse.ArgumentParser(description="DiningCode 메뉴/상세 수집기 (Papago 번역/캐시/에러가시화)")
     ap.add_argument("--files", nargs="+", required=True, help="JSON 파일/패턴 (공백 구분, 글롭 지원)")
     ap.add_argument("--timeout", type=float, default=8.0, help="HTTP 타임아웃(초)")
     ap.add_argument("--sleep", type=float, default=0.3, help="요청 간 대기(초)")
@@ -668,201 +789,268 @@ def main():
 
     # 번역 옵션
     ap.add_argument("--translate", choices=["auto","romanize","off"], default="romanize",
-                    help="다국어 생성 모드 (기본 romanize: 외부 호출 없음)")
-    ap.add_argument("--translate-timeout", type=float, default=2.0, help="번역 호출 타임아웃(초)")
-    ap.add_argument("--translate-max", type=int, default=30, help="외부 번역 총 호출 상한(언어 합산)")
-    ap.add_argument("--translate-provider", choices=["auto_chain","googletrans","deep"], default="auto_chain",
-                    help="auto_chain: googletrans→deep_translator 폴백")
+                    help="다국어 생성 모드 (auto=Papago, romanize=외부호출 없음)")
+    ap.add_argument("--translate-timeout", type=float, default=8.0, help="번역 호출 타임아웃(초)")
+    ap.add_argument("--translate-max", type=int, default=0,  # ≤0 → 무제한
+                    help="외부 번역 총 호출 상한(언어 합산). 0 이하면 무제한.")
+    ap.add_argument("--translate-provider",
+                    choices=["papago","auto_chain","googletrans","deep"],
+                    default="papago", help="번역 제공자 (기본 papago)")
+
     ap.add_argument("--zh-variant", choices=["cn","tw"], default="cn", help="중국어 변형: cn=간체, tw=번체")
-    ap.add_argument("--trace-translate", action="store_true", help="번역 호출 로그 출력")
+    ap.add_argument("--trace-translate", type=str2bool, default=False, nargs="?", const=True,
+                    help="번역 호출/캐시 상세 로그 출력")
 
-    # ✅ 추가 옵션
-    ap.add_argument("--cache-file", default=None, help="번역 캐시 JSON 경로")
+    # 추가 옵션
+    ap.add_argument("--cache-file", default=".cache/restaurant-trans.json", help="번역 캐시 JSON 경로")
     ap.add_argument("--dict-mode", choices=["off","exact","token"], default="token", help="사전 적용 범위")
-    ap.add_argument("--log-every", type=int, default=100, help="N개 처리마다 진행 로그")
+    ap.add_argument("--log-every", type=int, default=100, help="N개 처리마다 진행 로그(보조 로그)")
 
-    args = ap.parse_args()
+    # Papago 설정
+    ap.add_argument("--config", default="config.json", help="Papago 키를 포함한 설정 파일 경로")
+    ap.add_argument("--papago-honorific", type=str2bool, default=True, nargs="?",
+                    const=True, help="Papago 한국어 경어 옵션(true/false)")
 
+    # 에러 로그 파일
+    ap.add_argument("--tx-error-log", default=".logs/papago_errors.json",
+                    help="Papago 실패 이벤트 JSON 로그 경로")
+
+    ns = ap.parse_args()
+    # translate_max: ≤0 → None(무제한)
+    tmax: Optional[int] = None if ns.translate_max is None or ns.translate_max <= 0 else int(ns.translate_max)
+    return Args(
+        files=ns.files,
+        timeout=ns.timeout,
+        sleep=ns.sleep,
+        force=ns.force,
+        upgrade=ns.upgrade,
+        show=ns.show,
+        translate=ns.translate,
+        translate_timeout=ns.translate_timeout,
+        translate_max=tmax,
+        translate_provider=ns.translate_provider,
+        zh_variant=ns.zh_variant,
+        trace_translate=ns.trace_translate,
+        config=ns.config,
+        cache_file=ns.cache_file,
+        log_every=ns.log_every,
+        papago_honorific=ns.papago_honorific,
+        tx_error_log=ns.tx_error_log,
+        dict_mode=ns.dict_mode,
+    )
+
+# -------------------- 캐시 I/O --------------------
+def load_trans_cache(path: Optional[str]):
+    if not path: return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cnt = 0
+        if isinstance(data, dict):
+            for dest, m in data.items():
+                if not isinstance(m, dict): continue
+                # 과거 파일에 'cn'/'zh' 등 비표준 키가 들어있어도 읽을 때 정규화
+                dest_norm = norm_dest_lang(dest)
+                for norm_text, val in m.items():
+                    _trans_cache[(dest_norm, norm_text)] = val
+                    cnt += 1
+        print(f"[CACHE] 로드: {cnt}건 from {path}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[CACHE] 로드 실패({e}) — 무시")
+
+def save_trans_cache(path: Optional[str]):
+    if not path: return
+    out: Dict[str, Dict[str, str]] = {}
+    for (dest_norm, norm_text), val in _trans_cache.items():
+        out.setdefault(dest_norm, {})[norm_text] = val
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        print(f"[CACHE] 저장: {len(_trans_cache)}건 -> {path}")
+    except Exception as e:
+        print(f"[CACHE] 저장 실패({e}) — 무시")
+
+# -------------------- 처리 --------------------
+def process_record(session: requests.Session, trans: Optional[TransCtl], rid: str, args: Args) -> Dict[str, Any]:
+    url = _mk_url(rid)
+    html = fetch_html(url, timeout=args.timeout)
+
+    # 이름
+    name = parse_store_name(html)
+    name_json = build_name_ml_json(name, args.translate, trans, args.zh_variant)
+
+    # 메뉴
+    rows_menu = parse_menuinfo_items(html)
+    for r in rows_menu:
+        r["name_json"] = ml_with_dict(
+            r.get("name",""),
+            args.translate,
+            trans,
+            args.zh_variant,
+            dict_mode=args.dict_mode
+        )
+
+    # 텍스트
+    textinfo = parse_textinfo(html)
+    btxt = textinfo.get("btxt", [])
+    tags = textinfo.get("tags", [])
+    chars = textinfo.get("chars", [])
+
+    description = compose_description(btxt, tags, chars)
+    description_json = build_ml_json(description, args.translate, trans)
+
+    short_description = compose_short_description(btxt, tags)
+    short_description_json = build_ml_json(short_description, args.translate, trans)
+
+    return {
+        "rid": rid,
+        "url": url,
+        "name": name,
+        "name_json": name_json,  # {"ko","en","cn"}
+        "description": description,
+        "description_json": description_json,  # {"ko","en","cn"}
+        "short_description": short_description,
+        "short_description_json": short_description_json,  # {"ko","en","cn"}
+        "menu_rows": rows_menu,
+        "_meta": {
+            "collected_at": now_local_str(),
+            "translator": (trans.provider if trans else "none"),
+            "zh_variant": args.zh_variant,
+        }
+    }
+
+# -------------------- 메인 --------------------
+def main():
+    start_perf = time.perf_counter()
+    print(f"[TIME] 시작: {now_local_str()}")
+
+    args = parse_args()
+
+    # 번역 컨트롤러 구성
     transctl: Optional[TransCtl] = None
     if args.translate == "auto":
+        provider = args.translate_provider or "papago"
         transctl = TransCtl(
-            provider=args.translate_provider,
+            provider=provider,
             timeout=args.translate_timeout,
-            max_calls=args.translate_max,
+            max_calls=args.translate_max,  # None이면 무제한
             zh_variant=args.zh_variant,
             trace=args.trace_translate,
+            config_path=args.config,
+            papago_honorific=args.papago_honorific,
+        )
+    else:
+        transctl = TransCtl(
+            provider="none",
+            timeout=args.translate_timeout,
+            max_calls=None,
+            zh_variant=args.zh_variant,
+            trace=False,
         )
 
     # 캐시 로드
     load_trans_cache(args.cache_file)
 
-    file_list = gather_files(args.files)
-    if not file_list:
-        print("[ERR] --files 패턴에 해당하는 파일이 없습니다.", file=sys.stderr)
-        _end(start_perf); save_trans_cache(args.cache_file); sys.exit(2)
+    files = gather_files(args.files)
+    if not files:
+        print("[ERR] --files에 해당하는 입력이 없습니다.", file=sys.stderr)
+        _save_papago_errors(args.tx_error_log)
+        _print_papago_summary()
+        print(f"[TIME] 종료: {now_local_str()}")
+        sys.exit(2)
 
+    # 파일별 RID 수 & 전체 수집
     vrids: List[str] = []
     seen: Set[str] = set()
-    for path in file_list:
+    cumulative = 0
+    print(f"[INFO] 입력 파일 {len(files)}개")
+    for path in files:
         ids = collect_vrids_from_file(path)
+        unique_ids = []
         for rid in ids:
             if rid not in seen:
-                seen.add(rid); vrids.append(rid)
+                seen.add(rid)
+                unique_ids.append(rid)
+        cumulative += len(unique_ids)
+        vrids.extend(unique_ids)
+        print(f"[FILE] {path} → rid:{len(unique_ids)}건 (누적:{cumulative})")
+    print(f"[INFO] 총 대상 RID {len(vrids)}건")
 
-    if not vrids:
-        print("[ERR] 입력 파일들에서 v_rid를 찾지 못했습니다.", file=sys.stderr)
-        _end(start_perf); save_trans_cache(args.cache_file); sys.exit(2)
+    session = _requests_session(timeout=args.timeout)
 
-    print(f"[INFO] 대상 RID {len(vrids)}건")
-    m_ok = m_skip = m_upg = 0
-    t_ok = t_skip = 0
-    total_err = 0
+    # 루프
+    ok = skip = err = 0
     t0 = time.perf_counter()
+    total = len(vrids)
+    for i, rid in enumerate(vrids, 1):
+        # 매 항목 진행상황 출력
+        print(f"[STEP] {i}/{total} rid={rid}")
 
-    for idx, rid in enumerate(vrids, 1):
-        url = _mk_url(rid)
+        # 보조 진행 로그(주기적)
+        if args.log_every and (i == 1 or i % args.log_every == 0):
+            calls = getattr(transctl, "calls_used", None) if transctl else None
+            elapsed = time.perf_counter() - t0
+            print(f"[PROG] {i}/{total} elapsed={elapsed:.1f}s tx_calls={calls}")
+
         menu_out = os.path.join("data", "menu", f"{rid}.json")
         text_out = os.path.join("data", "detail", f"{rid}.json")
 
-        if (idx == 1) or (idx % max(1, args.log_every) == 0):
-            elapsed = time.perf_counter() - t0
-            calls = getattr(transctl, "calls_used", None) if transctl else None
-            extra = f", tx_calls={calls}" if calls is not None else ""
-            print(f"[PROG] {idx}/{len(vrids)} elapsed={elapsed:.1f}s rid={rid}{extra}")
-
-        print(f"\n[{idx}/{len(vrids)}] RID={rid}")
-
-        # 업그레이드(메뉴 파일만)
-        if os.path.exists(menu_out) and args.upgrade and not args.force:
-            if upgrade_existing_menu_file(menu_out, args.translate, transctl, args.zh_variant, args.dict_mode):
-                m_upg += 1
-            else:
-                m_skip += 1
-
         need_menu = args.force or (not os.path.exists(menu_out))
         need_text = args.force or (not os.path.exists(text_out))
-        need_fetch = need_menu or need_text
+        if not need_menu and not need_text and not args.upgrade:
+            skip += 1
+            continue
 
-        rows_menu: List[Dict[str, Any]] = []
-        textinfo: Dict[str, List[str]] = {}
-        name = ""
-        name_json = {"ko":"", "en":"", "cn":""}
-        description = ""
-        description_json: Dict[str, str] = {"ko":"", "en":"", "cn":""}
-        short_description = ""
-        short_description_json: Dict[str, str] = {"ko":"", "en":"", "cn":""}
-
-        if need_fetch:
-            print(f"[INFO] 요청: {url}")
-            try:
-                html = fetch_html(url, timeout=args.timeout)
-            except Exception as e:
-                print(f"[ERR] 페이지 요청 실패(RID={rid}): {e}", file=sys.stderr)
-                total_err += 1
-                if args.sleep and idx < len(vrids): time.sleep(args.sleep)
-                continue
-
-            # 이름 & 번역
-            name = parse_store_name(html)
-            name_json = build_name_ml_json(name, args.translate, transctl, args.zh_variant)
-
-            # 메뉴
-            if need_menu:
-                rows_menu = parse_menuinfo_items(html)
-                for r in rows_menu:
-                    r["name_json"] = ml_with_dict(r.get("name",""), args.translate, transctl, args.zh_variant, dict_mode=args.dict_mode)
-
-            # 상세 텍스트
-            if need_text:
-                textinfo = parse_textinfo(html)
-                btxt = textinfo.get("btxt", [])
-                tags = textinfo.get("tags", [])
-                chars = textinfo.get("chars", [])
-
-                description = compose_description(btxt, tags, chars)
-                description_json = build_ml_json(description, args.translate, transctl)
-
-                short_description = compose_short_description(btxt, tags)
-                short_description_json = build_ml_json(short_description, args.translate, transctl)
-
-        # 저장/스킵 — 메뉴
         try:
-            if need_menu:
-                save_json(rows_menu, menu_out)
-                m_ok += 1
-            else:
-                print(f"[SKIP] 메뉴 파일 존재: {menu_out} (force 미사용)")
-                m_skip += 1
-        except Exception as e:
-            print(f"[ERR] 메뉴 저장 실패(RID={rid}): {e}", file=sys.stderr)
-            total_err += 1
+            data = process_record(session, transctl, rid, args)
+            if need_menu and data.get("menu_rows"):
+                save_json(menu_out, data["menu_rows"])
+            elif args.upgrade and os.path.exists(menu_out):
+                if upgrade_existing_menu_file(menu_out, args.translate, transctl, args.zh_variant, dict_mode=args.dict_mode):
+                    print(f"[UPG] menu name_json 채움: {menu_out}")
 
-        # 저장/스킵 — 상세
-        try:
             if need_text:
-                save_text_json(
-                    rid, url,
-                    name, name_json,
-                    textinfo,
-                    description, description_json,
-                    short_description, short_description_json,
-                    text_out
-                )
-                t_ok += 1
-            else:
-                print(f"[SKIP] 텍스트 파일 존재: {text_out} (force 미사용)")
-                t_skip += 1
+                save_json(text_out, {
+                    "rid": rid,
+                    "url": data["url"],
+                    "name": data["name"],
+                    "name_json": data["name_json"],
+                    "description": data["description"],
+                    "description_json": data["description_json"],
+                    "short_description": data["short_description"],
+                    "short_description_json": data["short_description_json"],
+                    "_meta": data["_meta"],
+                })
+            ok += 1
+
+            if args.show:
+                print(f"[OK] RID={rid} | name={data['name_json']}")
+                if data.get("menu_rows"):
+                    print(f"  MENU x{len(data['menu_rows'])}: " + ", ".join(r['name'] for r in data["menu_rows"][:6]))
+
         except Exception as e:
-            print(f"[ERR] 텍스트 저장 실패(RID={rid}): {e}", file=sys.stderr)
-            total_err += 1
+            err += 1
+            print(f"[ERR] RID={rid} 처리 실패: {e}", file=sys.stderr)
 
-        # 화면 표시
-        if args.show:
-            try:
-                rows_for_show = rows_menu
-                if not rows_for_show and os.path.exists(menu_out):
-                    with open(menu_out, "r", encoding="utf-8") as f:
-                        rows_for_show = json.load(f)
-                print(f"[SHOW] 메뉴 {len(rows_for_show)}건")
-                print_menu_table(rows_for_show)
-            except Exception as e:
-                print(f"[WARN] 메뉴 표시 실패: {e}", file=sys.stderr)
-
-            try:
-                text_payload = {
-                    "url": url,
-                    "name": name,
-                    "name_json": name_json,
-                    "btxt": textinfo.get("btxt", []),
-                    "tags": textinfo.get("tags", []),
-                    "chars": textinfo.get("chars", []),
-                    "description": description,
-                    "description_json": description_json,
-                    "short_description": short_description,
-                    "short_description_json": short_description_json,
-                }
-                print_textinfo(text_payload)
-            except Exception as e:
-                print(f"[WARN] 텍스트 표시 실패: {e}", file=sys.stderr)
-
-        if args.sleep and idx < len(vrids):
+        if args.sleep and i < total:
             time.sleep(args.sleep)
 
-    print("\n[SUMMARY]")
-    print(f"  메뉴 새로 저장: {m_ok}건")
-    print(f"  메뉴 업그레이드: {m_upg}건")
-    print(f"  메뉴 스킵: {m_skip}건")
-    print(f"  텍스트 새로 저장: {t_ok}건")
-    print(f"  텍스트 스킵: {t_skip}건")
-    print(f"  실패: {total_err}건")
-    _end(start_perf)
+    # 캐시 저장
     save_trans_cache(args.cache_file)
 
-def _end(start_perf: float):
-    print(f"[TIME] 종료: {now_local_str()}")
-    dt = time.perf_counter() - start_perf
-    m = int(dt // 60); s = dt - m*60
-    print(f"[TIME] 총 소요: {dt:.3f}s ({m}m {s:.3f}s)")
+    # Papago 요약/로그 저장
+    _save_papago_errors(args.tx_error_log)
+    _print_papago_summary()
+
+    print(f"[DONE] ok:{ok} skip:{skip} err:{err}")
+    elapsed = time.perf_counter() - start_perf
+    print(f"[TIME] 종료: {now_local_str()} (elapsed={elapsed:.1f}s)")
 
 if __name__ == "__main__":
     main()
