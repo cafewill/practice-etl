@@ -9,7 +9,7 @@ Step #3  좌측 목록의 a.place_bluelink 클릭 → 우측 entryIframe 상세�
         주소(도로명/지번), 전화번호,
         정보 탭(place_section_content 하위 ul>li 및 li div)의 편의시설(노이즈 제거·중복 제거),
         메뉴 탭 클릭 후 메뉴명/가격(0원/무의미명 제외),
-        사진 탭 클릭 후 상세 사진 목록 수집(특정 도메인 제외; 사진 탭의 place_section_content
+        사진 탭 클릭 후 상세 사진 목록 수집(검색 CDN 제외; 사진 탭의 place_section_content
         내부 a.place_thumb > img 우선 추출, 기본 5장)
 
 출력:
@@ -476,10 +476,29 @@ def wait_entry_for_name(page, name: str, timeout_ms: int, verbose: bool):
         page.wait_for_timeout(250)
     raise PWTimeout(f"Timeout {timeout_ms}ms: entryIframe not matched for name. last={last}")
 
-# ===== 상단(홈) 카드의 소개문 추출 =====
+# ===== 설명(홈 카드) — 노이즈 필터 강화 =====
+_DESC_NOISE = re.compile(
+    r"(알림|알림받기|공지|공지사항|안내|문의|전화|이벤트|쿠폰|예약|주문|출발|도착|길찾기|공유|저장|네이버|광고|업주|신고)",
+    re.I,
+)
+def _description_is_noise(t: str) -> bool:
+    if not t:
+        return True
+    if _DESC_NOISE.search(t):
+        return True
+    if "http" in t or "https" in t:
+        return True
+    # 전화/가격 등도 제외
+    if re.search(r"\b\d{2,4}[-\s]?\d{3,4}[-\s]?\d{3,4}\b", t):
+        return True
+    if "원" in t:
+        return True
+    return False
+
 def extract_intro_description(fr, verbose: bool) -> str:
     """
-    기본 상세(홈) 상단 카드에 노출되는 소개 문구(예: '시그니처 음료와 함께하는 제주 여행')를 수집.
+    기본 상세(홈) 상단 카드에 노출되는 소개 문구(예: '시그니처 음료와 함께하는 제주 여행') 수집.
+    불필요 키워드(알림/안내 등) 자동 필터.
     """
     for sel in [
         "div.XtBbS",
@@ -490,12 +509,13 @@ def extract_intro_description(fr, verbose: bool) -> str:
             loc = fr.locator(sel).first
             if loc and loc.count():
                 t = clean_text(loc.inner_text(timeout=600))
-                if 8 <= len(t) <= 180 and not re.search(r"(리뷰|영업|쿠폰|예약|주문|길찾기|출발|도착|공유|전화|네이버)", t):
+                if 8 <= len(t) <= 180 and not _description_is_noise(t):
                     debug_print(verbose, f"description(found@{sel}): {t[:40]}{'...' if len(t)>40 else ''}")
                     return t
         except Exception:
             pass
 
+    # 휴리스틱 스캔
     try:
         nodes = fr.locator("div")
         n = min(120, nodes.count())
@@ -504,9 +524,7 @@ def extract_intro_description(fr, verbose: bool) -> str:
                 t = clean_text(nodes.nth(i).inner_text(timeout=150))
             except Exception:
                 continue
-            if not t or len(t) < 8 or len(t) > 180:
-                continue
-            if re.search(r"(리뷰|영업|쿠폰|예약|주문|저장|길찾기|출발|도착|공유|전화|네이버|원)", t):
+            if not t or len(t) < 8 or len(t) > 180 or _description_is_noise(t):
                 continue
             if re.fullmatch(r"[가-힣A-Za-z0-9\s\.,·\u00B7\-!~]+", t):
                 debug_print(verbose, f"description(heuristic): {t[:40]}{'...' if len(t)>40 else ''}")
@@ -539,11 +557,9 @@ def _normalize_category_text(t: str) -> str:
     return ", ".join(out)
 
 def extract_category_detail(fr, verbose: bool) -> str:
-    # 0) 타이틀 영역 고정 패턴 (#_title 내부)
     title_scope = fr.locator('#_title, [id="_title"]')
     try:
         if title_scope and title_scope.count():
-            # a) 가장 신뢰도 높은 전용 클래스(소문자 l, 대문자 i 모두 지원)
             for sel in (".lnJFt", ".InJfT", 'span[class*="lnJFt"]', 'span[class*="InJfT"]'):
                 loc = title_scope.locator(sel).first
                 if loc and loc.count():
@@ -552,7 +568,6 @@ def extract_category_detail(fr, verbose: bool) -> str:
                     if cat:
                         debug_print(verbose, f"category(found@#_title {sel}): {cat}")
                         return cat
-            # b) GHAhO(상호) 다음에 오는 스팬 텍스트를 후보로
             spans = title_scope.locator("span")
             gh_idx = -1
             for i in range(min(12, spans.count())):
@@ -572,7 +587,6 @@ def extract_category_detail(fr, verbose: bool) -> str:
     except Exception:
         pass
 
-    # 1) 기타 대표 클래스들
     for sel in [
         'div[class*="title"] span.lnJFt',
         'div[class*="title"] span.InJfT',
@@ -590,7 +604,6 @@ def extract_category_detail(fr, verbose: bool) -> str:
         except Exception:
             pass
 
-    # 2) 상단 영역 휴리스틱
     try:
         head = fr.locator('div[class*="title"]').first
         nodes = (head.locator("span,div,a") if head and head.count() else fr.locator("span,div,a"))
@@ -807,7 +820,7 @@ def extract_address_block(fr, timeout_ms: int, verbose: bool):
     return final, road, jibun, tel
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 편의시설(정보 탭) 수집 — 노이즈 제거/중복 제거
+# 편의시설(정보 탭) 수집 — 노이즈 제거/중복 제거(소셜/링크/불용어 필터 강화)
 # ──────────────────────────────────────────────────────────────────────────────
 
 _AMEN_STOPWORDS = {
@@ -815,6 +828,11 @@ _AMEN_STOPWORDS = {
     "이전페이지", "다음페이지", "펼쳐보기", "접기", "업주", "업주에게 문의",
     "찾아오는길", "이전/다음", "추천순", "최신순", "필터", "업체 정보 수정",
 }
+# 소셜/링크류 필터 키워드
+_AMEN_URL_NOISE = re.compile(
+    r"(https?://|www\.)|(블로그|네이버블로그|티스토리|홈페이지|페이스북|facebook|인스타그램|instagram|메타|meta|카카오|sns)",
+    re.I,
+)
 
 _AMEN_MAP = {
     "주차": r"(주차|발레|발렛)",
@@ -838,6 +856,8 @@ def _is_noise_token(token: str) -> bool:
     if not t:
         return True
     if t in _AMEN_STOPWORDS:
+        return True
+    if _AMEN_URL_NOISE.search(t):
         return True
     if re.search(r"(이전|다음|펼쳐보기|접기|닫기|찾아오는길|페이지)", t):
         return True
@@ -955,8 +975,8 @@ def extract_menu(fr, limit: int, verbose: bool) -> List[Dict[str, Any]]:
     return items
 
 def extract_detail_photos(fr, max_cnt: int, verbose: bool) -> List[str]:
-    """사진 탭에서 상세 이미지 URL을 수집한다.
-    - place_section_content 내부 a.place_thumb > img 를 1순위로 탐색
+    """사진 탭에서 상세 이미지 URL 수집.
+    - place_section_content 내부 a.place_thumb > img 우선
     - https://search.pstatic.net/common/ 등 검색 CDN 이미지는 제외
     - data:, blob: 등 비정상 스킴 제외
     - 중복 제거, 최대 max_cnt(기본 5)
@@ -993,7 +1013,6 @@ def extract_detail_photos(fr, max_cnt: int, verbose: bool) -> List[str]:
         if base not in urls:
             urls.append(base)
 
-    # 1) 사진 탭의 섹션 컨텐츠 안에서 a.place_thumb > img 우선
     try:
         cont = fr.locator("div.place_section_content")
         if cont and cont.count():
@@ -1005,7 +1024,6 @@ def extract_detail_photos(fr, max_cnt: int, verbose: bool) -> List[str]:
     except Exception:
         pass
 
-    # 2) 보조: 사진/갤러리 표식이 있는 구역에서 img 수집
     try:
         scopes = fr.locator(':is(section,div,ul):has-text("사진"), :is(section,div,ul):has-text("갤러리")')
         for i in range(min(3, scopes.count())):
@@ -1017,7 +1035,6 @@ def extract_detail_photos(fr, max_cnt: int, verbose: bool) -> List[str]:
     except Exception:
         pass
 
-    # 3) 최후: 프레임 전체에서 img 훑기
     try:
         imgs = fr.locator("img")
         for i in range(imgs.count()):
