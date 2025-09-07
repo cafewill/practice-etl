@@ -1,0 +1,25 @@
+{
+  "default_profile": "local",
+  "profiles": {
+    "local": {
+      "mysql": {
+        "host": "jejuyeora-test-db-server.cpkumwc0ac2a.ap-northeast-2.rds.amazonaws.com",
+        "port": 27836,
+        "user": "jejuyeora_admin",
+        "password": "jejuyeoratest123!",
+        "db": "DEMO",
+        "charset": "utf8mb4"
+      }
+    },
+    "prod": {
+      "mysql": {
+        "host": "jejuyeora-test-db-server.cpkumwc0ac2a.ap-northeast-2.rds.amazonaws.com",
+        "port": 27836,
+        "user": "jejuyeora_admin",
+        "password": "jejuyeoratest123!",
+        "db": "jejuyeora",
+        "charset": "utf8mb4"
+      }
+    }
+  }
+}
