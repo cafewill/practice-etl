@@ -21,5 +21,8 @@
         "charset": "utf8mb4"
       }
     }
-  }
+  },
+
+  "PAPAGO_CLIENT_ID": "xk5cazbxdb",
+  "PAPAGO_CLIENT_SECRET": "V3niQ4jH0xnkDUzoa68jC4EgaZOaf8lC13THc5Pw"
 }
